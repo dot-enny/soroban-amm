@@ -121,6 +121,22 @@ fn pair(h: &Harness<'_>) -> PairKey {
     }
 }
 
+fn generated_pair(env: &Env) -> PairKey {
+    let first = Address::generate(env);
+    let second = Address::generate(env);
+    if first < second {
+        PairKey {
+            token_a: first,
+            token_b: second,
+        }
+    } else {
+        PairKey {
+            token_a: second,
+            token_b: first,
+        }
+    }
+}
+
 mod panicking_mock_adapter {
     use soroban_sdk::{contract, contractimpl, Address, Env};
 
@@ -1466,6 +1482,99 @@ fn remove_pair_allows_a_configured_pair_without_sources() {
     h.aggregator.remove_pair(&h.admin, &pair(&h));
 
     assert_eq!(h.aggregator.list_pairs(&0, &MAX_PAGE_SIZE).len(), 0);
+}
+
+#[test]
+fn pair_index_handles_more_pairs_than_instance_storage() {
+    const PAIR_COUNT: u32 = 700;
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let mut pairs = soroban_sdk::Vec::new(&env);
+
+    for _ in 0..PAIR_COUNT {
+        let configured_pair = generated_pair(&env);
+        h.aggregator.set_pair_config(
+            &h.admin,
+            &configured_pair,
+            &None,
+            &None,
+            &Some(2),
+        );
+        pairs.push_back(configured_pair);
+    }
+
+    let last_page = h.aggregator.list_pairs(&650, &MAX_PAGE_SIZE);
+    assert_eq!(last_page.len(), 50);
+    assert_eq!(last_page.get_unchecked(0), pairs.get_unchecked(650));
+    assert_eq!(last_page.get_unchecked(49), pairs.get_unchecked(699));
+}
+
+#[test]
+fn list_pairs_preserves_order_and_compacts_after_removal() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let mut pairs = soroban_sdk::Vec::new(&env);
+    for _ in 0..5 {
+        let configured_pair = generated_pair(&env);
+        h.aggregator.set_pair_config(
+            &h.admin,
+            &configured_pair,
+            &None,
+            &None,
+            &Some(2),
+        );
+        pairs.push_back(configured_pair);
+    }
+
+    let first_page = h.aggregator.list_pairs(&0, &2);
+    let second_page = h.aggregator.list_pairs(&2, &2);
+    assert_eq!(first_page.get_unchecked(0), pairs.get_unchecked(0));
+    assert_eq!(first_page.get_unchecked(1), pairs.get_unchecked(1));
+    assert_eq!(second_page.get_unchecked(0), pairs.get_unchecked(2));
+    assert_eq!(second_page.get_unchecked(1), pairs.get_unchecked(3));
+
+    h.aggregator
+        .remove_pair(&h.admin, &pairs.get_unchecked(1));
+    let after_removal = h.aggregator.list_pairs(&1, &2);
+    assert_eq!(after_removal.get_unchecked(0), pairs.get_unchecked(2));
+    assert_eq!(after_removal.get_unchecked(1), pairs.get_unchecked(3));
+}
+
+#[test]
+fn list_pairs_migrates_legacy_instance_index() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let first = generated_pair(&env);
+    let second = generated_pair(&env);
+    let mut legacy_pairs = soroban_sdk::Vec::new(&env);
+    legacy_pairs.push_back(first.clone());
+    legacy_pairs.push_back(second.clone());
+    let aggregator = h.aggregator.address.clone();
+    env.as_contract(&aggregator, || {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PairCount);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PairAtIndex(0));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PairAtIndex(1));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PairIndex(first.clone()));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::PairIndex(second.clone()));
+        env.storage()
+            .instance()
+            .set(&DataKey::Pairs, &legacy_pairs);
+    });
+
+    let migrated = h.aggregator.list_pairs(&0, &MAX_PAGE_SIZE);
+    assert_eq!(migrated.len(), 2);
+    assert_eq!(migrated.get_unchecked(0), first);
+    assert_eq!(migrated.get_unchecked(1), second);
 }
 
 #[test]

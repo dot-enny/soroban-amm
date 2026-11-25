@@ -146,9 +146,12 @@ pub enum DataKey {
     Sources,
     MaxDeviationBps,
     Paused,
-    Pairs,
+    Pairs, // Legacy instance-storage index; migrated to persistent storage.
     PairSources(PairKey),
     PairConfig(PairKey),
+    PairCount,
+    PairAtIndex(u32),
+    PairIndex(PairKey),
 }
 
 pub const MIN_VALID_SOURCES: u32 = 2;
@@ -217,8 +220,6 @@ impl OracleAggregator {
 
         let empty: Vec<OracleSource> = Vec::new(&env);
         env.storage().instance().set(&DataKey::Sources, &empty);
-        let pairs: Vec<PairKey> = Vec::new(&env);
-        env.storage().instance().set(&DataKey::Pairs, &pairs);
         emit_versioned_event!(
             env,
             (symbol_short!("init"),),
@@ -384,12 +385,7 @@ impl OracleAggregator {
         Self::extend_ttl(&env);
         require_admin(&env, &admin);
         let pair = canonical_pair(&env, pair.token_a, pair.token_b).0;
-        let pairs: Vec<PairKey> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Pairs)
-            .unwrap_or_else(|| Vec::new(&env));
-        if !pairs.contains(&pair) {
+        if read_pair_index(&env, &pair).is_none() {
             panic_with_error!(&env, OracleError::PairNotFound);
         }
         env.storage()
@@ -562,12 +558,9 @@ impl OracleAggregator {
             env.storage().instance().set(&DataKey::Sources, &sources);
         }
 
-        let pairs: Vec<PairKey> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Pairs)
-            .unwrap_or_else(|| Vec::new(&env));
-        for pair in pairs.iter() {
+        let pair_count = read_pair_count(&env);
+        for i in 0..pair_count {
+            let pair = read_pair_at_index(&env, i);
             let mut pair_sources = read_pair_sources(&env, &pair);
             let mut pair_migrated = false;
             for i in 0..pair_sources.len() {
@@ -784,12 +777,15 @@ impl OracleAggregator {
     pub fn list_pairs(env: Env, cursor: u32, limit: u32) -> Vec<PairKey> {
         Self::extend_ttl(&env);
         validate_page(&env, limit);
-        let pairs: Vec<PairKey> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Pairs)
-            .unwrap_or_else(|| Vec::new(&env));
-        page_pairs(&env, &pairs, cursor, limit)
+        let pair_count = read_pair_count(&env);
+        let end = core::cmp::min(pair_count, cursor.saturating_add(limit));
+        let mut pairs = Vec::new(&env);
+        let mut index = cursor;
+        while index < end {
+            pairs.push_back(read_pair_at_index(&env, index));
+            index += 1;
+        }
+        pairs
     }
 
     pub fn get_pair_config(env: Env, pair: PairKey) -> PairConfig {
@@ -883,10 +879,10 @@ impl OracleAggregator {
             .unwrap_or_else(|| panic_with_error!(&env, OracleError::NotInitialized))
     }
 
-    /// Instance-storage TTL maintenance.
+    /// Storage TTL maintenance and legacy pair-index migration.
     ///
-    /// Global configuration and the pair index live in instance storage;
-    /// pair-specific sources and policies live in persistent storage and are
+    /// Global configuration lives in instance storage; the pair index,
+    /// pair-specific sources, and policies live in persistent storage and are
     /// extended whenever read or written. If the instance entry's TTL lapses,
     /// the contract is archived and every call traps until someone restores it.
     /// Every public entrypoint therefore bumps the instance TTL, including the
@@ -900,6 +896,10 @@ impl OracleAggregator {
     /// entries on one schedule.
     fn extend_ttl(env: &Env) {
         env.storage().instance().extend_ttl(172_800, 518_400);
+        migrate_pair_index(env);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::PairCount, 172_800, 518_400);
     }
 }
 
@@ -975,31 +975,115 @@ fn write_pair_config(env: &Env, pair: &PairKey, config: &PairConfig) {
         .extend_ttl(&key, 172_800, 518_400);
 }
 
-fn add_pair(env: &Env, pair: &PairKey) {
-    let mut pairs: Vec<PairKey> = env
-        .storage()
-        .instance()
-        .get(&DataKey::Pairs)
-        .unwrap_or_else(|| Vec::new(env));
-    if !pairs.contains(pair) {
-        pairs.push_back(pair.clone());
-        env.storage().instance().set(&DataKey::Pairs, &pairs);
+fn migrate_pair_index(env: &Env) {
+    let count_key = DataKey::PairCount;
+    if env.storage().persistent().has(&count_key) {
+        return;
     }
-}
 
-fn remove_pair_index(env: &Env, pair: &PairKey) {
     let pairs: Vec<PairKey> = env
         .storage()
         .instance()
         .get(&DataKey::Pairs)
         .unwrap_or_else(|| Vec::new(env));
-    let mut remaining = Vec::new(env);
-    for candidate in pairs.iter() {
-        if candidate != pair.clone() {
-            remaining.push_back(candidate);
-        }
+    for i in 0..pairs.len() {
+        let pair = pairs.get_unchecked(i);
+        write_pair_at_index(env, i, &pair);
+        write_pair_index(env, &pair, i);
     }
-    env.storage().instance().set(&DataKey::Pairs, &remaining);
+    write_pair_count(env, pairs.len());
+    env.storage().instance().remove(&DataKey::Pairs);
+}
+
+fn read_pair_count(env: &Env) -> u32 {
+    env.storage()
+        .persistent()
+        .get(&DataKey::PairCount)
+        .unwrap_or(0)
+}
+
+fn write_pair_count(env: &Env, count: u32) {
+    let key = DataKey::PairCount;
+    env.storage().persistent().set(&key, &count);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 172_800, 518_400);
+}
+
+fn read_pair_at_index(env: &Env, index: u32) -> PairKey {
+    let key = DataKey::PairAtIndex(index);
+    let pair = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .unwrap_or_else(|| panic_with_error!(env, OracleError::PairNotFound));
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 172_800, 518_400);
+    pair
+}
+
+fn write_pair_at_index(env: &Env, index: u32, pair: &PairKey) {
+    let key = DataKey::PairAtIndex(index);
+    env.storage().persistent().set(&key, pair);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 172_800, 518_400);
+}
+
+fn read_pair_index(env: &Env, pair: &PairKey) -> Option<u32> {
+    let key = DataKey::PairIndex(pair.clone());
+    let index = env.storage().persistent().get(&key);
+    if index.is_some() {
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, 172_800, 518_400);
+    }
+    index
+}
+
+fn write_pair_index(env: &Env, pair: &PairKey, index: u32) {
+    let key = DataKey::PairIndex(pair.clone());
+    env.storage().persistent().set(&key, &index);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, 172_800, 518_400);
+}
+
+fn add_pair(env: &Env, pair: &PairKey) {
+    if read_pair_index(env, pair).is_none() {
+        let index = read_pair_count(env);
+        let next_count = index
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("pair index capacity exceeded"));
+        write_pair_at_index(env, index, pair);
+        write_pair_index(env, pair, index);
+        write_pair_count(env, next_count);
+    }
+}
+
+fn remove_pair_index(env: &Env, pair: &PairKey) {
+    let removed_index = read_pair_index(env, pair)
+        .unwrap_or_else(|| panic_with_error!(env, OracleError::PairNotFound));
+    let pair_count = read_pair_count(env);
+    if removed_index >= pair_count {
+        panic_with_error!(env, OracleError::PairNotFound);
+    }
+    let last_index = pair_count - 1;
+
+    for index in removed_index..last_index {
+        let next_pair = read_pair_at_index(env, index + 1);
+        write_pair_at_index(env, index, &next_pair);
+        write_pair_index(env, &next_pair, index);
+    }
+
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PairAtIndex(last_index));
+    env.storage()
+        .persistent()
+        .remove(&DataKey::PairIndex(pair.clone()));
+    write_pair_count(env, last_index);
 }
 
 fn validate_page(env: &Env, limit: u32) {
@@ -1019,17 +1103,6 @@ fn page_sources(
     let mut index = cursor;
     while index < end {
         result.push_back(sources.get_unchecked(index));
-        index += 1;
-    }
-    result
-}
-
-fn page_pairs(env: &Env, pairs: &Vec<PairKey>, cursor: u32, limit: u32) -> Vec<PairKey> {
-    let mut result = Vec::new(env);
-    let end = core::cmp::min(pairs.len(), cursor.saturating_add(limit));
-    let mut index = cursor;
-    while index < end {
-        result.push_back(pairs.get_unchecked(index));
         index += 1;
     }
     result
